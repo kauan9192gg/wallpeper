@@ -3,7 +3,7 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <shellapi.h>
-#include <shlobj.h>        // ← ADICIONA ISSO
+#include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -81,20 +81,21 @@ static HBITMAP loadJpg(const char *p) {
 // ============================================================
 #define WM_TRAY (WM_USER + 1)
 #define WM_THUMB_DONE (WM_USER + 2)
+#define WM_SCAN_DONE  (WM_USER + 3)
 
 typedef struct {
     char    path[MAX_PATH];
-    HBITMAP orig;      // bitmap original (carregado 1x)
-    HBITMAP thumb;     // bitmap redimensionado p/ THUMB_W x THUMB_H
-    HBITMAP big;       // bitmap redimensionado p/ preview (240 x 200)
+    HBITMAP orig;
+    HBITMAP thumb;
+    HBITMAP big;
     int     loading;
-    int     fav;       // 0/1
-    int     cat;       // 0=Anime 1=Scenery 2=Abstract
+    int     fav;
+    int     cat;
 } Wall;
 
 static HWND  hw, hcfg;
 static int   sw, sh, paused;
-static char  file[MAX_PATH], cfg[MAX_PATH], wallsCfg[MAX_PATH], dir[MAX_PATH];
+static char  file[MAX_PATH], cfg[MAX_PATH], dir[MAX_PATH];
 static PROCESS_INFORMATION pi;
 static HANDLE job;
 static NOTIFYICONDATA nid;
@@ -106,32 +107,32 @@ static Wall  *walls = NULL;
 static int    wallCount = 0, wallCap = 0;
 static int    sel = -1;
 static int    hoverCard = -1;
-static int    hoverBtn = -1;   // 0=apply 1=fav 2=del
+static int    hoverBtn = -1;
 static int    dragging = 0;
 static float  speed = 1.0f;
 static HANDLE pipeH = INVALID_HANDLE_VALUE;
 static int    scrollY = 0, maxScroll = 0;
 
-// tabs: 0=BIBLIOTECA 1=CONFIG
 static int    tab = 0;
 
 // config
-static int    cfgPauseFS  = 1;   // pausar em fullscreen
-static int    cfgPlaylist = 0;   // minutos, 0 = off
+static int    cfgPauseFS  = 1;
+static int    cfgPlaylist = 0;
 static char   cfgFolder[MAX_PATH] = {0};
 static int    cfgStartWin = 0;
 static DWORD  playlistLast = 0;
 
-// filtros da biblioteca
+// filtros
 static int    filterFav = 0;
-static int    filterCat = -1;   // -1=todos
+static int    filterCat = -1;
 
-// cache do glow do card selecionado
+// glow
 static HBITMAP glowBmp = NULL;
 static int     glowFor = -1;
 
-// cache das thumbs visíveis desenhadas (evita StretchBlt)
-// (thumb é redimensionada uma vez em buildThumb e guardada)
+// loading overlay
+static int    loadingCount = 0;
+static int    scanning = 0;
 
 // ============================================================
 //                      util
@@ -204,7 +205,7 @@ static int busy(void) {
 }
 
 // ============================================================
-//                      scale bitmap (bicúbica via StretchBlt)
+//                      scale bitmap
 // ============================================================
 static HBITMAP scaleBitmap(HBITMAP src, int dstW, int dstH) {
     if (!src) return NULL;
@@ -218,7 +219,6 @@ static HBITMAP scaleBitmap(HBITMAP src, int dstW, int dstH) {
     HGDIOBJ od = SelectObject(ddc, dst);
     SetStretchBltMode(ddc, HALFTONE);
     SetBrushOrgEx(ddc, 0, 0, NULL);
-    // aspect fill
     float sa = (float)bm.bmWidth / bm.bmHeight;
     float da = (float)dstW / dstH;
     int sw2, sh2, sx, sy;
@@ -257,7 +257,7 @@ static DWORD WINAPI thumbThread(LPVOID p) {
     if (CreateProcess(NULL, cmd, NULL, NULL, FALSE,
                       CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
                       NULL, NULL, &si, &pr)) {
-        WaitForSingleObject(pr.hProcess, 10000);
+        WaitForSingleObject(pr.hProcess, 15000);
         CloseHandle(pr.hProcess); CloseHandle(pr.hThread);
     }
 
@@ -282,18 +282,23 @@ static void thumbStart(const char *video, HWND notify) {
     snprintf(tdir, sizeof tdir, "%s\\thumbs", dir);
     CreateDirectory(tdir, NULL);
     snprintf(out, sizeof out, "%s\\%08x.jpg", tdir, hh);
-    if (GetFileAttributes(out) != INVALID_FILE_ATTRIBUTES) return;
 
     ThumbJob *j = malloc(sizeof *j);
     strncpy(j->video, video, MAX_PATH-1); j->video[MAX_PATH-1]=0;
     strncpy(j->out, out, MAX_PATH-1);     j->out[MAX_PATH-1]=0;
     j->notify = notify;
+
+    if (GetFileAttributes(out) != INVALID_FILE_ATTRIBUTES) {
+        // thumb ja existe em cache: notifica imediatamente
+        PostMessage(notify, WM_THUMB_DONE, 0, (LPARAM)j);
+        return;
+    }
+
     HANDLE t = CreateThread(NULL, 0, thumbThread, j, 0, NULL);
     if (t) CloseHandle(t);
-    else free(j);
+    else { PostMessage(notify, WM_THUMB_DONE, 0, (LPARAM)j); }
 }
 
-// constrói todas as versões escaladas (chamado 1x por wall)
 static void buildThumbs(Wall *w) {
     if (!w->orig) {
         unsigned int hh = hashStr(w->path);
@@ -307,15 +312,45 @@ static void buildThumbs(Wall *w) {
 }
 
 // ============================================================
-//                      walls list (com cfg: fav / cat)
+//                      scan de pasta (thread)
 // ============================================================
-static void wallsSave(void) {
-    FILE *f = fopen(wallsCfg, "w");
-    if (!f) return;
-    for (int i = 0; i < wallCount; i++)
-        fprintf(f, "%d|%d|%s\n", walls[i].fav, walls[i].cat, walls[i].path);
-    fclose(f);
+typedef struct { char folder[MAX_PATH]; HWND notify; } ScanJob;
+
+static int isVideoExt(const char *p) {
+    const char *e = strrchr(p, '.');
+    if (!e) return 0;
+    e++;
+    return !_stricmp(e,"mp4") || !_stricmp(e,"mkv") || !_stricmp(e,"webm") ||
+           !_stricmp(e,"avi") || !_stricmp(e,"mov") || !_stricmp(e,"gif") ||
+           !_stricmp(e,"wmv") || !_stricmp(e,"flv") || !_stricmp(e,"m4v");
 }
+
+static DWORD WINAPI scanThread(LPVOID p) {
+    ScanJob *j = (ScanJob*)p;
+    char pat[MAX_PATH];
+    snprintf(pat, sizeof pat, "%s\\*", j->folder);
+    WIN32_FIND_DATA fd;
+    HANDLE f = FindFirstFile(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) {
+        PostMessage(j->notify, WM_SCAN_DONE, 0, (LPARAM)j);
+        return 0;
+    }
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!isVideoExt(fd.cFileName)) continue;
+        char *cp = malloc(MAX_PATH);
+        snprintf(cp, MAX_PATH, "%s\\%s", j->folder, fd.cFileName);
+        cp[MAX_PATH-1] = 0;
+        PostMessage(j->notify, WM_SCAN_DONE, 1, (LPARAM)cp);
+    } while (FindNextFile(f, &fd));
+    FindClose(f);
+    PostMessage(j->notify, WM_SCAN_DONE, 0, (LPARAM)j);
+    return 0;
+}
+
+// ============================================================
+//                      walls list
+// ============================================================
 static int wallsHas(const char *p) {
     for (int i = 0; i < wallCount; i++)
         if (!_stricmp(walls[i].path, p)) return 1;
@@ -333,7 +368,7 @@ static void wallsAdd(const char *p) {
     walls[wallCount].loading = 1;
     walls[wallCount].cat = 0;
     wallCount++;
-    wallsSave();
+    loadingCount++;
     thumbStart(p, hcfg);
 }
 static void wallsRemove(int idx) {
@@ -342,38 +377,10 @@ static void wallsRemove(int idx) {
     if (w->orig)  DeleteObject(w->orig);
     if (w->thumb) DeleteObject(w->thumb);
     if (w->big)   DeleteObject(w->big);
+    if (w->loading && loadingCount > 0) loadingCount--;
     for (int i = idx; i < wallCount - 1; i++) walls[i] = walls[i+1];
     wallCount--;
-    wallsSave();
     if (sel >= wallCount) sel = wallCount - 1;
-}
-static void wallsLoad(void) {
-    FILE *f = fopen(wallsCfg, "r");
-    if (!f) return;
-    char line[MAX_PATH + 16];
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "\r\n")] = 0;
-        if (!line[0]) continue;
-        // formato: fav|cat|path  OU  path (compat. versão antiga)
-        char *p1 = strchr(line, '|');
-        if (p1) {
-            char *p2 = strchr(p1 + 1, '|');
-            if (p2) {
-                *p1 = 0; *p2 = 0;
-                int fav = atoi(line);
-                int cat = atoi(p1 + 1);
-                char *path = p2 + 1;
-                wallsAdd(path);
-                if (wallCount > 0) {
-                    walls[wallCount-1].fav = fav;
-                    walls[wallCount-1].cat = cat;
-                }
-                continue;
-            }
-        }
-        wallsAdd(line);
-    }
-    fclose(f);
 }
 static void wallsFree(void) {
     for (int i = 0; i < wallCount; i++) {
@@ -382,9 +389,10 @@ static void wallsFree(void) {
         if (walls[i].big)   DeleteObject(walls[i].big);
     }
     free(walls); walls = NULL; wallCount = wallCap = 0;
+    loadingCount = 0;
 }
 
-// lista filtrada (retorna índice real)
+// filtros
 static int passFilter(int i) {
     if (filterFav && !walls[i].fav) return 0;
     if (filterCat >= 0 && walls[i].cat != filterCat) return 0;
@@ -395,7 +403,7 @@ static int visibleCount(void) {
     for (int i = 0; i < wallCount; i++) if (passFilter(i)) n++;
     return n;
 }
-static int visibleAt(int v) {   // v-ésimo visível -> índice real
+static int visibleAt(int v) {
     int n = 0;
     for (int i = 0; i < wallCount; i++) {
         if (!passFilter(i)) continue;
@@ -416,6 +424,8 @@ static void launch(void) {
     }
     if (pipeH != INVALID_HANDLE_VALUE) { CloseHandle(pipeH); pipeH = INVALID_HANDLE_VALUE; }
 
+    if (!file[0]) return;
+
     char cmd[3072];
     snprintf(cmd, sizeof cmd,
         "\"%s\\mpv.exe\" --no-config --wid=%lu --profile=fast --hwdec=auto-safe "
@@ -434,8 +444,6 @@ static void launch(void) {
         paused = 0;
     } else {
         pi.hProcess = NULL;
-        MessageBox(NULL, "Nao achei o mpv.exe. Coloque ele na mesma pasta do litewall.exe.",
-                   "LiteWall", MB_ICONERROR);
     }
 }
 
@@ -450,7 +458,7 @@ static int pick(void) {
 }
 
 // ============================================================
-//                      cfg (config)
+//                      cfg
 // ============================================================
 static void saveCfg(void) {
     FILE *f = fopen(cfg, "w");
@@ -469,13 +477,10 @@ static void loadCfg(void) {
     cfgPauseFS  = a;
     cfgPlaylist = b;
     cfgStartWin = c;
-    // consome newline
     int ch; while ((ch = fgetc(f)) != '\n' && ch != EOF);
     if (fgets(cfgFolder, MAX_PATH, f)) cfgFolder[strcspn(cfgFolder, "\r\n")] = 0;
     fclose(f);
 }
-
-// start com Windows via Run
 static void setStartWithWindows(int on) {
     HKEY k;
     if (RegOpenKeyEx(HKEY_CURRENT_USER,
@@ -531,7 +536,7 @@ static void textC(HDC dc, const char *s, RECT *r, HFONT f, COLORREF c, UINT fmt)
 }
 
 // ============================================================
-//                      ícones
+//                      icones
 // ============================================================
 static void icBolt(HDC dc, int cx, int cy, int sz, COLORREF c1, COLORREF c2) {
     POINT top[4] = {
@@ -617,7 +622,7 @@ static RECT previewPanel(void) {
     RECT r = {RIGHT_X, HEADER_H + TABS_H + PAD, CFG_W - PAD, CFG_H - 24};
     return r;
 }
-static RECT cardRect(int v) {  // v = índice visível
+static RECT cardRect(int v) {
     RECT g = gridArea();
     int col = v % COLS, row = v / COLS;
     int x = g.left + col * (THUMB_W + GAP);
@@ -664,19 +669,16 @@ static int hitSlider(int x, int y) {
 }
 
 // ============================================================
-//                      glow em buffer
+//                      glow
 // ============================================================
 static void buildGlow(void) {
     if (glowBmp) { DeleteObject(glowBmp); glowBmp = NULL; }
     if (sel < 0) return;
-    RECT g = gridArea();
     int gw = THUMB_W + 20, gh = CARD_H + 20;
     HDC screen = GetDC(NULL);
     HDC dc = CreateCompatibleDC(screen);
     glowBmp = CreateCompatibleBitmap(screen, gw, gh);
     HGDIOBJ ob = SelectObject(dc, glowBmp);
-    // fundo transparente = preto (vai usar SRCAND? nao, vamos usar só como imagem)
-    // desenha glow com bordas em camadas
     for (int i = 8; i > 0; i--) {
         int t = 100 - i * 11;
         if (t < 18) t = 18;
@@ -697,7 +699,7 @@ static void buildGlow(void) {
 }
 
 // ============================================================
-//                      desenho
+//                      draw preview
 // ============================================================
 static void drawPreview(HDC dc) {
     RECT p = previewPanel();
@@ -712,14 +714,18 @@ static void drawPreview(HDC dc) {
     if (real >= 0) {
         Wall *w = &walls[real];
         buildThumbs(w);
-        if (w->big) {
+        if (w->loading) {
+            RECT e = pv;
+            textC(dc, "Carregando preview...", &e, fSmall, C_SUB_DIM,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else if (w->big) {
             HDC mem = CreateCompatibleDC(dc);
             HGDIOBJ ob = SelectObject(mem, w->big);
             BitBlt(dc, pv.left + 30, pv.top + 24, 240, 200, mem, 0, 0, SRCCOPY);
             SelectObject(mem, ob); DeleteDC(mem);
         } else {
             RECT e = pv;
-            textC(dc, "Gerando preview...", &e, fSmall, C_SUB_DIM,
+            textC(dc, "Sem preview", &e, fSmall, C_SUB_DIM,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         const char *base = strrchr(w->path, '\\');
@@ -732,7 +738,7 @@ static void drawPreview(HDC dc) {
               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
-    int can = (real >= 0);
+    int can = (real >= 0 && !walls[real].loading);
 
     // Apply
     RECT ab = applyBtn();
@@ -772,6 +778,9 @@ static void drawPreview(HDC dc) {
           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
+// ============================================================
+//                      draw card
+// ============================================================
 static void drawCard(HDC dc, int vi) {
     int i = visibleAt(vi);
     if (i < 0) return;
@@ -780,7 +789,6 @@ static void drawCard(HDC dc, int vi) {
     int hov = (vi == hoverCard);
 
     if (selected && glowBmp) {
-        // desenha glow ao redor
         HDC mem = CreateCompatibleDC(dc);
         HGDIOBJ ob = SelectObject(mem, glowBmp);
         BitBlt(dc, r.left - 10, r.top - 10,
@@ -806,7 +814,8 @@ static void drawCard(HDC dc, int vi) {
     } else {
         fillC(dc, &im, C_CARD_HOV);
         RECT e = im;
-        textC(dc, "...", &e, fSmall, C_SUB_DIM, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        textC(dc, w->loading ? "Carregando..." : "...", &e, fSmall, C_SUB_DIM,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     SelectClipRgn(dc, NULL);
     DeleteObject(clip);
@@ -828,19 +837,14 @@ static void drawCard(HDC dc, int vi) {
         SelectObject(dc,ob); SelectObject(dc,op); DeleteObject(b); DeleteObject(p);
     }
 
-    // estrela se favorito
     if (w->fav) {
         icStarFilled(dc, r.right - 16, r.top + 16, 7, C_PURPLE);
     }
 }
 
 // ============================================================
-//                      aba Config
+//                      config
 // ============================================================
-static RECT cfgRow(int i) {
-    RECT r = {PAD, HEADER_H + TABS_H + PAD + i * 50, CFG_W - PAD, HEADER_H + TABS_H + PAD + i * 50 + 44};
-    return r;
-}
 static void drawCheck(HDC dc, int x, int y, int on) {
     RECT b = {x, y, x + 20, y + 20};
     if (on) {
@@ -853,7 +857,6 @@ static void drawCheck(HDC dc, int x, int y, int on) {
 static void drawConfig(HDC dc) {
     int y = HEADER_H + TABS_H + PAD;
 
-    // Pausar em fullscreen
     RECT r1 = {PAD, y, CFG_W - PAD, y + 44};
     roundB(dc, &r1, 6, C_CARD, C_BORDER);
     drawCheck(dc, r1.left + 16, r1.top + 12, cfgPauseFS);
@@ -862,7 +865,6 @@ static void drawConfig(HDC dc) {
           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     y += 54;
 
-    // Iniciar com Windows
     RECT r2 = {PAD, y, CFG_W - PAD, y + 44};
     roundB(dc, &r2, 6, C_CARD, C_BORDER);
     drawCheck(dc, r2.left + 16, r2.top + 12, cfgStartWin);
@@ -871,7 +873,6 @@ static void drawConfig(HDC dc) {
           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     y += 54;
 
-    // Playlist
     RECT r3 = {PAD, y, CFG_W - PAD, y + 44};
     roundB(dc, &r3, 6, C_CARD, C_BORDER);
     RECT t3 = {r3.left + 16, r3.top, r3.left + 260, r3.bottom};
@@ -883,12 +884,10 @@ static void drawConfig(HDC dc) {
     RECT b3 = {r3.left + 270, r3.top, r3.right - 100, r3.bottom};
     textC(dc, buf, &b3, fBody, C_CYAN, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // botões de playlist
     RECT minus = {r3.right - 90, r3.top + 8, r3.right - 62, r3.bottom - 8};
     RECT plus  = {r3.right - 56, r3.top + 8, r3.right - 28, r3.bottom - 8};
     roundB(dc, &minus, 4, C_BG_TOP, C_BORDER);
     roundB(dc, &plus,  4, C_BG_TOP, C_BORDER);
-    // "−" e "+"
     HPEN p = CreatePen(PS_SOLID, 2, C_TEXT);
     HGDIOBJ op = SelectObject(dc, p);
     MoveToEx(dc, minus.left + 8, (minus.top+minus.bottom)/2, NULL);
@@ -900,11 +899,10 @@ static void drawConfig(HDC dc) {
     SelectObject(dc, op); DeleteObject(p);
     y += 54;
 
-    // Pasta da biblioteca
     RECT r4 = {PAD, y, CFG_W - PAD, y + 60};
     roundB(dc, &r4, 6, C_CARD, C_BORDER);
     RECT t4 = {r4.left + 16, r4.top + 8, r4.right - 20, r4.top + 28};
-    textC(dc, "Pasta padrao para adicionar wallpapers", &t4, fSmall, C_SUB,
+    textC(dc, "Pasta padrao (adiciona todos os wallpapers da pasta)", &t4, fSmall, C_SUB,
           DT_LEFT | DT_SINGLELINE);
     RECT v4 = {r4.left + 16, r4.top + 30, r4.right - 130, r4.bottom - 8};
     textC(dc, cfgFolder[0] ? cfgFolder : "(nenhuma)", &v4, fSmall, C_TEXT,
@@ -916,12 +914,14 @@ static void drawConfig(HDC dc) {
           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     y += 70;
 
-    // info
     RECT info = {PAD, y, CFG_W - PAD, y + 40};
     textC(dc, "Wallpapers: use o botao Adicionar. Botao direito no card para opcoes.",
           &info, fSmall, C_SUB_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
+// ============================================================
+//                      paint
+// ============================================================
 static void paintCfg(HWND h) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
@@ -934,7 +934,6 @@ static void paintCfg(HWND h) {
 
     roundGrad(mem, &rc, 0, C_BG_TOP, C_BG_BOT, FALSE);
 
-    // header
     icBolt(mem, 40, HEADER_H/2, 15, C_CYAN, C_PURPLE);
     RECT l1 = {64, 8, 240, HEADER_H - 8};
     textC(mem, "Lite", &l1, fLogo, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -945,7 +944,6 @@ static void paintCfg(HWND h) {
     RECT l2 = {64 + sz.cx, 8, 240, HEADER_H - 8};
     textC(mem, "Wall", &l2, fLogo, C_CYAN, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // botão adicionar (só na aba biblioteca)
     if (tab == 0) {
         RECT ab = addBtn();
         roundB(mem, &ab, 6, C_CARD, C_BORDER);
@@ -955,7 +953,6 @@ static void paintCfg(HWND h) {
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
-    // abas
     const char *tabNames[2] = {"Biblioteca", "Configuracoes"};
     for (int i = 0; i < 2; i++) {
         RECT r = tabRect(i);
@@ -968,11 +965,6 @@ static void paintCfg(HWND h) {
     if (tab == 1) {
         drawConfig(mem);
     } else {
-        // filtros (chips)
-        RECT chipY = {RIGHT_X - 130, HEADER_H + 42, RIGHT_X - 12, HEADER_H + 66};
-        (void)chipY;
-
-        // grade
         RECT ga = gridArea();
         HRGN clip = CreateRectRgn(ga.left - 20, ga.top - 20, ga.right + 20, ga.bottom);
         SelectClipRgn(mem, clip);
@@ -983,8 +975,8 @@ static void paintCfg(HWND h) {
                                       : "Nenhum wallpaper com esse filtro.",
                   &e, fBody, C_SUB, DT_CENTER | DT_SINGLELINE);
             RECT e2 = {ga.left, ga.top + 130, ga.right, ga.top + 160};
-            textC(mem, "Clique em Adicionar para comecar.", &e2, fSmall, C_SUB_DIM,
-                  DT_CENTER | DT_SINGLELINE);
+            textC(mem, "Use Adicionar ou escolha uma pasta em Configuracoes.",
+                  &e2, fSmall, C_SUB_DIM, DT_CENTER | DT_SINGLELINE);
         } else {
             for (int v = 0; v < n; v++) {
                 RECT r = cardRect(v);
@@ -997,8 +989,6 @@ static void paintCfg(HWND h) {
 
         drawPreview(mem);
 
-        // rodapé: slider velocidade
-        icSpeedoDummy:;
         RECT sep = {PAD, CFG_H - 74, W - PAD, CFG_H - 73};
         fillC(mem, &sep, C_BORDER);
         RECT vl = {PAD + 10, CFG_H - 60, PAD + 100, CFG_H - 36};
@@ -1027,6 +1017,50 @@ static void paintCfg(HWND h) {
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
+    // overlay de loading
+    if (loadingCount > 0 || scanning) {
+        HDC tmp = CreateCompatibleDC(mem);
+        HBITMAP tb = CreateCompatibleBitmap(mem, W, H);
+        HGDIOBJ ot = SelectObject(tmp, tb);
+        RECT fr2 = {0,0,W,H};
+        fillC(tmp, &fr2, RGB(10,10,20));
+        BLENDFUNCTION bf = {AC_SRC_OVER, 0, 160, 0};
+        AlphaBlend(mem, 0, 0, W, H, tmp, 0, 0, W, H, bf);
+        SelectObject(tmp, ot); DeleteObject(tb); DeleteDC(tmp);
+
+        static int spin = 0;
+        spin = (spin + 20) % 360;
+        int cx = W/2, cy = H/2 - 20;
+        for (int i = 0; i < 8; i++) {
+            double a = (spin + i*45) * 3.14159 / 180.0;
+            int px = cx + (int)(cos(a)*30);
+            int py = cy + (int)(sin(a)*30);
+            int alpha = 255 - i*28;
+            if (alpha < 30) alpha = 30;
+            COLORREF c = RGB(0, 229*alpha/255, 255*alpha/255);
+            HBRUSH b = CreateSolidBrush(c);
+            HGDIOBJ obb = SelectObject(mem, b);
+            HGDIOBJ opp = SelectObject(mem, GetStockObject(NULL_PEN));
+            Ellipse(mem, px-4, py-4, px+4, py+4);
+            SelectObject(mem, obb); SelectObject(mem, opp);
+            DeleteObject(b);
+        }
+
+        char msg[160];
+        if (scanning && loadingCount == 0)
+            snprintf(msg, sizeof msg, "Escaneando pasta...");
+        else if (loadingCount > 0)
+            snprintf(msg, sizeof msg, "Carregando wallpapers... (%d restantes)", loadingCount);
+        else
+            snprintf(msg, sizeof msg, "Carregando...");
+        RECT trr = {0, cy + 50, W, cy + 80};
+        textC(mem, msg, &trr, fBody, C_TEXT, DT_CENTER | DT_SINGLELINE);
+
+        SetTimer(h, 99, 80, NULL);
+    } else {
+        KillTimer(h, 99);
+    }
+
     BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
     SelectObject(mem, obm);
     DeleteObject(bm);
@@ -1035,9 +1069,16 @@ static void paintCfg(HWND h) {
 }
 
 // ============================================================
-//                      lógica
+//                      logica
 // ============================================================
 static void applyWall(const char *p) {
+    if (!p || !p[0]) return;
+    for (int i = 0; i < wallCount; i++) {
+        if (!_stricmp(walls[i].path, p)) {
+            if (walls[i].loading || !walls[i].thumb) return;
+            break;
+        }
+    }
     strncpy(file, p, MAX_PATH - 1);
     file[MAX_PATH-1] = 0;
     saveCfg();
@@ -1063,7 +1104,6 @@ static void updateScroll(void) {
     if (scrollY < 0) scrollY = 0;
 }
 
-// playlist: troca a cada cfgPlaylist minutos
 static void playlistTick(void) {
     if (cfgPlaylist <= 0) return;
     int n = visibleCount();
@@ -1073,7 +1113,6 @@ static void playlistTick(void) {
     if (playlistLast == 0) { playlistLast = now; return; }
     if (now - playlistLast >= interval) {
         playlistLast = now;
-        // próximo visível
         int cur = -1;
         for (int v = 0; v < n; v++) {
             int i = visibleAt(v);
@@ -1088,30 +1127,65 @@ static void playlistTick(void) {
 // ============================================================
 //                      cfgProc
 // ============================================================
-static void invalidateThumbRegion(HWND h, int vi) {
-    RECT r = cardRect(vi);
-    r.left -= 12; r.top -= 12; r.right += 12; r.bottom += 12;
-    InvalidateRect(h, &r, FALSE);
-}
-
 static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    // bloqueia interacao durante carregamento / scan
+    if ((loadingCount > 0 || scanning) &&
+        (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP || m == WM_RBUTTONUP ||
+         m == WM_MOUSEMOVE || m == WM_MOUSEWHEEL || m == WM_LBUTTONDBLCLK)) {
+        if (m == WM_MOUSEMOVE) SetCursor(LoadCursor(NULL, IDC_WAIT));
+        return 0;
+    }
+
     switch (m) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: paintCfg(h); return 0;
 
+    case WM_TIMER:
+        if (wp == 99) {
+            if (loadingCount > 0 || scanning)
+                InvalidateRect(h, NULL, FALSE);
+            else
+                KillTimer(h, 99);
+            return 0;
+        }
+        break;
+
+    case WM_SCAN_DONE: {
+        if (wp == 1) {
+            char *path = (char*)lp;
+            wallsAdd(path);
+            free(path);
+            updateScroll();
+            InvalidateRect(h, NULL, TRUE);
+            return 0;
+        } else {
+            ScanJob *j = (ScanJob*)lp;
+            if (j) free(j);
+            scanning = 0;
+            updateScroll();
+            InvalidateRect(h, NULL, TRUE);
+            return 0;
+        }
+    }
+
     case WM_THUMB_DONE: {
         ThumbJob *j = (ThumbJob*)lp;
-        for (int i = 0; i < wallCount; i++) {
-            if (!_stricmp(walls[i].path, j->video)) {
-                if (walls[i].orig)  { DeleteObject(walls[i].orig);  walls[i].orig = NULL; }
-                if (walls[i].thumb) { DeleteObject(walls[i].thumb); walls[i].thumb = NULL; }
-                if (walls[i].big)   { DeleteObject(walls[i].big);   walls[i].big = NULL; }
-                walls[i].loading = 0;
-                buildThumbs(&walls[i]);
-                break;
+        if (j) {
+            for (int i = 0; i < wallCount; i++) {
+                if (!_stricmp(walls[i].path, j->video)) {
+                    if (walls[i].orig)  { DeleteObject(walls[i].orig);  walls[i].orig = NULL; }
+                    if (walls[i].thumb) { DeleteObject(walls[i].thumb); walls[i].thumb = NULL; }
+                    if (walls[i].big)   { DeleteObject(walls[i].big);   walls[i].big = NULL; }
+                    if (walls[i].loading) {
+                        walls[i].loading = 0;
+                        if (loadingCount > 0) loadingCount--;
+                    }
+                    buildThumbs(&walls[i]);
+                    break;
+                }
             }
+            free(j);
         }
-        free(j);
         InvalidateRect(h, NULL, FALSE);
         return 0;
     }
@@ -1159,7 +1233,6 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
 
-        // abas
         for (int i = 0; i < 2; i++) {
             RECT r = tabRect(i);
             if (inR(&r, x, y)) {
@@ -1171,10 +1244,8 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
 
         if (tab == 1) {
-            // toggle pausa FS
             RECT r1 = {PAD, HEADER_H + TABS_H + PAD, CFG_W - PAD, HEADER_H + TABS_H + PAD + 44};
             if (inR(&r1, x, y)) { cfgPauseFS = !cfgPauseFS; saveCfg(); InvalidateRect(h, NULL, FALSE); return 0; }
-            // toggle start win
             RECT r2 = {PAD, r1.bottom + 10, CFG_W - PAD, r1.bottom + 54};
             if (inR(&r2, x, y)) {
                 cfgStartWin = !cfgStartWin;
@@ -1183,7 +1254,6 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 InvalidateRect(h, NULL, FALSE);
                 return 0;
             }
-            // playlist
             RECT r3 = {PAD, r2.bottom + 10, CFG_W - PAD, r2.bottom + 54};
             RECT minus = {r3.right - 90, r3.top + 8, r3.right - 62, r3.bottom - 8};
             RECT plus  = {r3.right - 56, r3.top + 8, r3.right - 28, r3.bottom - 8};
@@ -1197,7 +1267,6 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 playlistLast = 0;
                 saveCfg(); InvalidateRect(h, NULL, FALSE); return 0;
             }
-            // escolher pasta
             RECT r4 = {PAD, r3.bottom + 10, CFG_W - PAD, r3.bottom + 70};
             RECT b4 = {r4.right - 120, r4.top + 14, r4.right - 12, r4.top + 46};
             if (inR(&b4, x, y)) {
@@ -1210,14 +1279,23 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                     SHGetPathFromIDList(idl, cfgFolder);
                     CoTaskMemFree(idl);
                     saveCfg();
-                    InvalidateRect(h, NULL, FALSE);
+                    if (!scanning) {
+                        scanning = 1;
+                        ScanJob *sj = malloc(sizeof *sj);
+                        strncpy(sj->folder, cfgFolder, MAX_PATH-1);
+                        sj->folder[MAX_PATH-1] = 0;
+                        sj->notify = h;
+                        HANDLE t = CreateThread(NULL, 0, scanThread, sj, 0, NULL);
+                        if (t) CloseHandle(t);
+                        else { scanning = 0; free(sj); }
+                    }
+                    InvalidateRect(h, NULL, TRUE);
                 }
                 return 0;
             }
             return 0;
         }
 
-        // aba biblioteca
         if (hitAdd(x, y)) {
             char tmp[MAX_PATH];
             strncpy(tmp, file, MAX_PATH); tmp[MAX_PATH-1]=0;
@@ -1257,7 +1335,6 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         if (hitFav(x, y) && sel >= 0 && sel < wallCount) {
             walls[sel].fav = !walls[sel].fav;
-            saveCfg();
             InvalidateRect(h, NULL, FALSE);
             return 0;
         }
@@ -1308,14 +1385,14 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                         updateScroll();
                         InvalidateRect(h, NULL, TRUE);
                     } else if (c >= 1400) {
-                        walls[c - 1400].cat = 2; wallsSave(); InvalidateRect(h, NULL, FALSE);
+                        walls[c - 1400].cat = 2; InvalidateRect(h, NULL, FALSE);
                     } else if (c >= 1300) {
-                        walls[c - 1300].cat = 1; wallsSave(); InvalidateRect(h, NULL, FALSE);
+                        walls[c - 1300].cat = 1; InvalidateRect(h, NULL, FALSE);
                     } else if (c >= 1200) {
-                        walls[c - 1200].cat = 0; wallsSave(); InvalidateRect(h, NULL, FALSE);
+                        walls[c - 1200].cat = 0; InvalidateRect(h, NULL, FALSE);
                     } else if (c >= 1100) {
                         walls[c - 1100].fav = !walls[c - 1100].fav;
-                        wallsSave(); InvalidateRect(h, NULL, FALSE);
+                        InvalidateRect(h, NULL, FALSE);
                     } else if (c >= 1000) {
                         applyWall(walls[c - 1000].path);
                     }
@@ -1391,14 +1468,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     GetModuleFileName(NULL, dir, MAX_PATH);
     *strrchr(dir, '\\') = 0;
     snprintf(cfg, sizeof cfg, "%s\\litewall.cfg", dir);
-    snprintf(wallsCfg, sizeof wallsCfg, "%s\\walls.txt", dir);
 
     gdipInit();
 
     if (__argc > 1) strncpy(file, __argv[1], MAX_PATH - 1);
     else loadCfg();
-    if (!file[0] && !pick()) return 0;
-    saveCfg();
 
     job = CreateJobObject(NULL, NULL);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
@@ -1433,7 +1507,6 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
                           CW_USEDEFAULT,CW_USEDEFAULT,CFG_W,CFG_H,
                           NULL,NULL,hi,NULL);
 
-    wallsLoad();
     updateScroll();
     buildGlow();
 
@@ -1446,7 +1519,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     strcpy(nid.szTip, "LiteWall");
     Shell_NotifyIcon(NIM_ADD, &nid);
 
-    launch();
+    // so aplica se tiver file carregado do cfg
+    if (file[0]) launch();
     SetTimer(hw, 1, 500, NULL);
 
     MSG msg;
