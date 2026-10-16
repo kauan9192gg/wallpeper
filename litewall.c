@@ -91,6 +91,7 @@ typedef struct {
     int     loading;
     int     fav;
     int     cat;
+    int     tried;     // ja tentou gerar thumb (evita retry infinito)
 } Wall;
 
 static HWND  hw, hcfg;
@@ -98,6 +99,7 @@ static int   sw, sh, paused;
 static char  file[MAX_PATH], cfg[MAX_PATH], dir[MAX_PATH];
 static PROCESS_INFORMATION pi;
 static HANDLE job;
+static HANDLE thumbSem = NULL;
 static NOTIFYICONDATA nid;
 
 static HFONT fLogo, fBody, fSmall, fBtn, fSec;
@@ -239,6 +241,9 @@ typedef struct { char video[MAX_PATH]; char out[MAX_PATH]; HWND notify; } ThumbJ
 static DWORD WINAPI thumbThread(LPVOID p) {
     ThumbJob *j = (ThumbJob*)p;
 
+    // espera a vez (limita a 1 mpv de thumb por vez)
+    if (thumbSem) WaitForSingleObject(thumbSem, INFINITE);
+
     char tdir[MAX_PATH], tmp[MAX_PATH];
     snprintf(tdir, sizeof tdir, "%s\\thumbs", dir);
     CreateDirectory(tdir, NULL);
@@ -273,6 +278,7 @@ static DWORD WINAPI thumbThread(LPVOID p) {
     }
     RemoveDirectory(tmp);
 
+    if (thumbSem) ReleaseSemaphore(thumbSem, 1, NULL);
     PostMessage(j->notify, WM_THUMB_DONE, 0, (LPARAM)j);
     return 0;
 }
@@ -300,11 +306,15 @@ static void thumbStart(const char *video, HWND notify) {
 }
 
 static void buildThumbs(Wall *w) {
-    if (!w->orig) {
+    if (w->orig) {
+        // ja tem orig, so escala o que falta
+    } else if (!w->tried) {
         unsigned int hh = hashStr(w->path);
         char p[MAX_PATH];
         snprintf(p, sizeof p, "%s\\thumbs\\%08x.jpg", dir, hh);
         w->orig = loadJpg(p);
+    } else {
+        return;  // ja tentou e falhou, nao fica em loop
     }
     if (!w->orig) return;
     if (!w->thumb) w->thumb = scaleBitmap(w->orig, THUMB_W - 8, THUMB_H);
@@ -1176,6 +1186,7 @@ static LRESULT CALLBACK cfgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                     if (walls[i].orig)  { DeleteObject(walls[i].orig);  walls[i].orig = NULL; }
                     if (walls[i].thumb) { DeleteObject(walls[i].thumb); walls[i].thumb = NULL; }
                     if (walls[i].big)   { DeleteObject(walls[i].big);   walls[i].big = NULL; }
+                    walls[i].tried = 1;
                     if (walls[i].loading) {
                         walls[i].loading = 0;
                         if (loadingCount > 0) loadingCount--;
@@ -1471,6 +1482,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
 
     gdipInit();
 
+    // semaforo que limita a 1 mpv de thumb por vez
+    thumbSem = CreateSemaphore(NULL, 1, 1, NULL);
+
     if (__argc > 1) strncpy(file, __argv[1], MAX_PATH - 1);
     else loadCfg();
 
@@ -1534,6 +1548,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     DeleteObject(fLogo); DeleteObject(fBody);
     DeleteObject(fSmall); DeleteObject(fSec); DeleteObject(bBg);
     if (pipeH != INVALID_HANDLE_VALUE) CloseHandle(pipeH);
+    if (thumbSem) CloseHandle(thumbSem);
     gdipEnd();
     return 0;
 }
